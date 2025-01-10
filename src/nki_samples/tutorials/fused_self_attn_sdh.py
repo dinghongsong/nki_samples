@@ -13,7 +13,7 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
     kernel_dtype = q_ref.dtype
     pe_in_dt = nl.float16 if mix_precision else np.float32
     seqlen, d_head = q_ref.shape  # 4096, 64
-    out_ref = nl.ndarray((seqlen, d_head), dtype=q_ref.dtype, buffer=nl.shared_hbm)
+    out_ref = nl.ndarray(q_ref.shape, dtype=q_ref.dtype, buffer=nl.shared_hbm)
     softmax_scale = 0.125
     
     q_seq_n_tiles, q_seq_tile_size = seqlen // 128, 128
@@ -24,18 +24,18 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
 
     #####################################
     # 1. transpose v
-    trans_v = nl.ndarray((par_dim(v_seq_tile_size), v_seq_n_tiles, d_head), dtype=pe_in_dt) #defaults to sbuf
+    trans_v = nl.ndarray((v_seq_tile_size, v_seq_n_tiles, d_head), dtype=pe_in_dt) #defaults to sbuf
     ip_v = nl.arange(v_seq_tile_size)[:, None]
     if_v = nl.arange(d_head_tile_size)[None, :]
     for i in nl.affine_range(v_seq_n_tiles):
         trans_v[ip_v, i, if_v] = nl.load(v_ref[i * v_seq_tile_size + ip_v, if_v], dtype=pe_in_dt)
     
     # 2.
-    q_local = nl.ndarray((q_seq_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=pe_in_dt)
+    q_local = nl.ndarray((d_head_tile_size, q_seq_n_tiles,  q_seq_tile_size), dtype=pe_in_dt)
     ip_q = nl.arange(d_head_tile_size)[:, None]
     if_q = nl.arange(q_seq_tile_size)[None, :]
     for i in nl.affine_range(q_seq_n_tiles):
-        q_local[i, ip_q, if_q] = nl.load_transpose2d(
+        q_local[ip_q, i, if_q] = nl.load_transpose2d(
             q_ref[i * q_seq_tile_size + nl.arange(q_seq_tile_size)[:, None], nl.arange(d_head_tile_size)[None, :]], 
             dtype=pe_in_dt) * softmax_scale
     
@@ -58,29 +58,29 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
         if_max = nl.arange(k_seq_n_tiles)[None, :]
 
         for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
-            qk_psum = nl.zeros((par_dim(q_seq_tile_size), k_seq_tile_size), dtype=nl.float32, buffer=nl.psum)
+            # qk_psum = nl.zeros((par_dim(q_seq_tile_size), k_seq_tile_size), dtype=nl.float32, buffer=nl.psum)
             ip_qk = nl.arange(q_seq_tile_size)[:, None]
             if_qk = nl.arange(k_seq_tile_size)[None, :]
-            qk_psum[ip_qk, if_qk] += nisa.nc_matmul(q_local[i_q_seq_tile, ip_q, if_q],
+            qk_psum = nisa.nc_matmul(q_local[ip_q, i_q_seq_tile,  if_q],
                                                    k_local[i_k_seq_tile, ip_k, if_k])
  
             if use_causal_mask:
                 qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nisa.affine_select(
                     pred=(i_q_seq_tile * q_seq_tile_size + ip_qk >= i_k_seq_tile * k_seq_tile_size + if_qk), # row >= collomn
-                    on_true_tile=qk_psum[ip_qk, if_qk], 
+                    on_true_tile=qk_psum, 
                     on_false_value=-9984.0,
                     dtype=kernel_dtype
                 )
             else:
-                qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum[ip_qk, if_qk], dtype=kernel_dtype)
+                qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nl.copy(qk_psum, dtype=kernel_dtype)
             
 
-            neg_max_res[ip_max, i_k_seq_tile] = nisa.tensor_reduce(  #try nki.language.maximum ?
-                np.max, data=qk_res_buf[ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk], 
+            neg_max_res[:, i_k_seq_tile] = nisa.tensor_reduce(  #try nki.language.maximum ?
+                nl.max, data=qk_psum, 
                 axis=(1,), dtype=kernel_dtype, negate=True)
         
         neg_max_res_final = nisa.tensor_reduce(
-            np.min, data=neg_max_res[ip_max, if_max],
+            nl.min, data=neg_max_res,
             axis=(1,), dtype=kernel_dtype)
        
         #################### 128 x 6096 统一softmax
@@ -94,10 +94,10 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
         sum_divisor = nl.ndarray((par_dim(q_seq_tile_size), d_head_tile_size), dtype=kernel_dtype)
 
         exp_res = nisa.activation(np.exp, # note: partiiton <= 128, free no limit
-                                  data=qk_res_buf[ip_softmax, if_softmax],
+                                  data=qk_res_buf,
                                   bias=neg_max_res_final, scale=1.0)
         sum_res = nisa.tensor_reduce(np.add, # free no limit
-                                     data=exp_res[ip_softmax, if_softmax],
+                                     data=exp_res,
                                      axis=(1,), dtype=kernel_dtype)
                                      
         softmax_res[ip_softmax, if_softmax] = nl.copy(exp_res, dtype=pe_in_dt) #sbuf
@@ -116,25 +116,42 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
         ip_scores_t = nl.arange(k_seq_tile_size)[:, None]
         if_scores_t = nl.arange(q_seq_tile_size)[None, :]
         
-        for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
-            ip_scores = nl.arange(q_seq_tile_size)[:, None]
-            if_scores = nl.arange(k_seq_tile_size)[None, :]
-            trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t] = nisa.nc_transpose(
-                softmax_res[ip_scores, i_k_seq_tile * k_seq_tile_size + if_scores]
-            )
+        # for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+        #     ip_scores = nl.arange(q_seq_tile_size)[:, None]
+        #     if_scores = nl.arange(k_seq_tile_size)[None, :]
+        #     trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t] = nisa.nc_transpose(
+        #         softmax_res[ip_scores, i_k_seq_tile * k_seq_tile_size + if_scores]
+        #     )
+            
+        
+        # for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+        #     ip_v_t = nl.arange(k_seq_tile_size)[:, None]
+        #     if_v_t = nl.arange(d_head_tile_size)[None, :]
+
+        #     attn_res_psum += nisa.nc_matmul(
+        #         trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t],
+        #         trans_v[ip_v_t, i_k_seq_tile, if_v_t])
             
         
         for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+            ip_scores = nl.arange(q_seq_tile_size)[:, None]
+            if_scores = nl.arange(k_seq_tile_size)[None, :]
+            temp = nisa.nc_transpose(
+                softmax_res[ip_scores, i_k_seq_tile * k_seq_tile_size + if_scores]
+            )
+            
+   
             ip_v_t = nl.arange(k_seq_tile_size)[:, None]
             if_v_t = nl.arange(d_head_tile_size)[None, :]
 
             attn_res_psum += nisa.nc_matmul(
-                trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t],
+                temp,
                 trans_v[ip_v_t, i_k_seq_tile, if_v_t])
+
 
         attn_res_sbuf = nl.copy(attn_res_psum, dtype=kernel_dtype)
 
-        attn_res_div = attn_res_sbuf * sum_divisor[ip_sum_res, if_sum_res]
+        attn_res_div = attn_res_sbuf * sum_divisor
 
 
         nl.store(
