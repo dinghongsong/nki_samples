@@ -87,7 +87,13 @@ if __name__ == "__main__":
 
   P, X, Y = 5, 3, 4
   a = np.arange(P*X*Y, dtype=np.int8).reshape((P, X*Y))
-
+  print(a)
+  print("=========================")
+  print(a[np.arange(5)[:, None], np.arange(4)[None, :]])
+  print("=========================")
+  print(a[np.arange(5)[None, :], np.arange(4)[:, None]])
+  print("=========================")
+  print(a[np.arange(4), np.arange(4)])
   a_t_nki = tensor_transpose2D_kernel_(a, (X, Y))
 
   a_t_np = np.transpose(a.reshape(P, X, Y), (0, 2, 1)).reshape(P, X * Y)
