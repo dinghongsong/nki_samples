@@ -11,7 +11,7 @@ import time
 @nki.jit
 def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=False, mix_precision=True):
     kernel_dtype = q_ref.dtype
-    pe_in_dt = nl.float16 if mix_precision else np.float32
+    pe_in_dt = nl.float16 if mix_precision else nl.float32
     seqlen, d_head = q_ref.shape
     out_ref = nl.ndarray(q_ref.shape, dtype=q_ref.dtype, buffer=nl.shared_hbm)
     softmax_scale = 0.125
